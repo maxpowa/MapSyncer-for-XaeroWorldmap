@@ -2,12 +2,16 @@ package com.mapsyncer.server;
 
 import com.mapsyncer.platform.PlatformManager;
 import com.mapsyncer.platform.UpdateMode;
+import com.mapsyncer.util.NamedThreadFactory;
 import net.minecraft.server.MinecraftServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -20,13 +24,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 通过MCA文件时间戳检测哪些区域需要重新生成，
  * 仅更新有变化的区域以提高效率。
  *
+ * 增量扫描在后台线程执行，避免阻塞服务器主线程和造成CPU过载。
+ *
  * 注意：此类包含所有平台共享的业务逻辑，平台特定的事件注册由各平台薄包装器处理。
  */
 public class IncrementalUpdateHandlerLogic {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(IncrementalUpdateHandlerLogic.class);
 
-    /** 单例实例 */
+    /** ��例实例 */
     private static volatile IncrementalUpdateHandlerLogic instance;
 
     /** Minecraft服务器实例 */
@@ -40,6 +46,12 @@ public class IncrementalUpdateHandlerLogic {
 
     /** 上次计划更新的时间，用于防止同一天多次执行 */
     private volatile LocalDateTime lastScheduledUpdate = null;
+
+    /** 后台增量扫描线程池（单线程，防止并发）*/
+    private volatile ExecutorService incrementalScanExecutor = null;
+
+    /** 是否有扫描任务正在执行 */
+    private volatile boolean scanInProgress = false;
 
     private IncrementalUpdateHandlerLogic() {
         // 私有构造器，禁止外部实例化
@@ -75,6 +87,14 @@ public class IncrementalUpdateHandlerLogic {
         this.running = true;
         this.tickCounter.set(0);
         this.lastScheduledUpdate = null;
+        this.scanInProgress = false;
+
+        // 创建后台线程池（单线程，防止多个扫描任务并发）
+        if (incrementalScanExecutor == null || incrementalScanExecutor.isShutdown()) {
+            incrementalScanExecutor = Executors.newSingleThreadExecutor(
+                new NamedThreadFactory("mapsyncer-incremental-scan"));
+            LOGGER.info("Incremental scan executor started");
+        }
 
         UpdateMode mode = PlatformManager.getPlatform().getIncrementalUpdateMode();
         if (mode == UpdateMode.TICK) {
@@ -96,6 +116,19 @@ public class IncrementalUpdateHandlerLogic {
         server = null;
         tickCounter.set(0);
         lastScheduledUpdate = null;
+        
+        // 关闭后台扫描线程池
+        if (incrementalScanExecutor != null && !incrementalScanExecutor.isShutdown()) {
+            incrementalScanExecutor.shutdown();
+            try {
+                if (!incrementalScanExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    incrementalScanExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                incrementalScanExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
         LOGGER.info("Incremental update handler stopped");
     }
 
@@ -152,7 +185,7 @@ public class IncrementalUpdateHandlerLogic {
 
         if (currentTick >= interval) {
             tickCounter.set(0);
-            performScheduledUpdate("TICK mode interval");
+            scheduleAsyncUpdate("TICK mode interval");
         }
     }
 
@@ -173,13 +206,48 @@ public class IncrementalUpdateHandlerLogic {
         if (currentTime.isAfter(targetTime) && currentTime.isBefore(targetTime.plusMinutes(1))) {
             if (lastScheduledUpdate == null || !lastScheduledUpdate.toLocalDate().equals(now.toLocalDate())) {
                 lastScheduledUpdate = now;
-                performScheduledUpdate("SCHEDULED mode daily update at " + targetHour + ":" + targetMinute);
+                scheduleAsyncUpdate("SCHEDULED mode daily update at " + targetHour + ":" + targetMinute);
             }
         }
     }
 
     /**
+     * 在后台线程中异步执行增量扫描
+     *
+     * 防止服务器主线程阻塞，避免CPU过载。
+     * 如果扫描已在进行中，此方法将跳过新请求。
+     *
+     * @param reason 更新原因描述
+     */
+    private void scheduleAsyncUpdate(String reason) {
+        if (scanInProgress) {
+            LOGGER.debug("Incremental scan already in progress, skipping new request");
+            return;
+        }
+
+        if (incrementalScanExecutor == null || incrementalScanExecutor.isShutdown()) {
+            LOGGER.warn("Scan executor is not available, cannot schedule async update");
+            return;
+        }
+
+        LOGGER.info("Scheduling incremental update in background: {}", reason);
+        scanInProgress = true;
+
+        incrementalScanExecutor.submit(() -> {
+            try {
+                performScheduledUpdate(reason);
+            } catch (RuntimeException e) {
+                LOGGER.error("Error during async incremental update", e);
+            } finally {
+                scanInProgress = false;
+            }
+        });
+    }
+
+    /**
      * 执行计划更新
+     *
+     * 在后台线程中调用，不会阻塞服务器主线程。
      *
      * @param reason 更新原因描述
      */
@@ -211,6 +279,8 @@ public class IncrementalUpdateHandlerLogic {
             return "Stopped";
         }
 
+        String scanStatus = scanInProgress ? " (scan in progress)" : "";
+
         UpdateMode mode = PlatformManager.getPlatform().getIncrementalUpdateMode();
         switch (mode) {
             case DISABLED:
@@ -218,8 +288,8 @@ public class IncrementalUpdateHandlerLogic {
             case TICK:
                 int interval = PlatformManager.getPlatform().getIncrementalUpdateIntervalTicks();
                 int remaining = interval - tickCounter.get();
-                return String.format("TICK mode: next update in %d ticks (%.1f seconds)",
-                    remaining, remaining / 20.0f);
+                return String.format("TICK mode: next update in %d ticks (%.1f seconds)%s",
+                    remaining, remaining / 20.0f, scanStatus);
             case SCHEDULED:
                 int targetHour = PlatformManager.getPlatform().getScheduledUpdateHour();
                 int targetMinute = PlatformManager.getPlatform().getScheduledUpdateMinute();
@@ -230,8 +300,8 @@ public class IncrementalUpdateHandlerLogic {
                     nextUpdate = nextUpdate.plusDays(1);
                 }
                 long secondsUntil = java.time.Duration.between(now, nextUpdate).getSeconds();
-                return String.format("SCHEDULED mode: next update at %02d:%02d (in %dh %dm)",
-                    targetHour, targetMinute, secondsUntil / 3600, (secondsUntil % 3600) / 60);
+                return String.format("SCHEDULED mode: next update at %02d:%02d (in %dh %dm)%s",
+                    targetHour, targetMinute, secondsUntil / 3600, (secondsUntil % 3600) / 60, scanStatus);
             default:
                 return "Unknown mode";
         }
